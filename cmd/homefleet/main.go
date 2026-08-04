@@ -78,7 +78,11 @@ func cmdServe(cfg config.Config, args []string) error {
 	table := discover.NewTable(cfg)
 	errCh := make(chan error, 2)
 	go func() {
-		errCh <- discover.RunBeacon(ctx, cfg, table)
+		if err := discover.RunBeacon(ctx, cfg, table); err != nil {
+			fmt.Fprintf(os.Stderr, "homefleet: beacon warning: %v (HTTP agent still running; discovery limited)\n", err)
+			<-ctx.Done()
+		}
+		errCh <- nil
 	}()
 	go func() {
 		fmt.Fprintf(os.Stderr, "homefleet listening on :%d (beacon :%d) id=%s exec=%v scope=%s\n",
@@ -90,6 +94,9 @@ func cmdServe(cfg config.Config, args []string) error {
 	case <-ctx.Done():
 		return nil
 	case err := <-errCh:
+		if err != nil {
+			stop()
+		}
 		return err
 	}
 }

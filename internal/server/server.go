@@ -98,7 +98,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	addr := net.JoinHostPort("0.0.0.0", fmt.Sprintf("%d", s.cfg.HTTPPort))
+	// Empty host => dual-stack where the OS supports it (helps Windows LAN reachability).
+	addr := net.JoinHostPort("", fmt.Sprintf("%d", s.cfg.HTTPPort))
 	httpServer := &http.Server{Addr: addr, Handler: s.Handler()}
 	errCh := make(chan error, 1)
 	go func() {

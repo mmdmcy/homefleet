@@ -145,6 +145,14 @@ func RunBeacon(ctx context.Context, cfg config.Config, table *Table) error {
 	defer ticker.Stop()
 
 	broadcast := func() {
+		table.Upsert(Peer{
+			ID:       cfg.DeviceID,
+			Hostname: cfg.Hostname,
+			OS:       cfg.OS,
+			IP:       "127.0.0.1",
+			HTTPPort: cfg.HTTPPort,
+			Self:     true,
+		})
 		payload, _ := json.Marshal(table.SelfBeacon())
 		for _, dst := range broadcastAddrs(cfg.BeaconPort) {
 			_, _ = conn.WriteToUDP(payload, dst)
