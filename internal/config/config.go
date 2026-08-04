@@ -18,16 +18,18 @@ const (
 )
 
 type Config struct {
-	Token      string
-	ExecEnabled bool
-	Scope      string
-	DeviceID   string
-	Hostname   string
-	OS         string
-	HTTPPort   int
-	BeaconPort int
-	AllowCIDRs []string
-	EnvPath    string
+	Token             string
+	ExecEnabled       bool
+	Scope             string
+	DeviceID          string
+	Hostname          string
+	OS                string
+	HTTPPort          int
+	BeaconPort        int
+	AllowCIDRs        []string
+	EnvPath           string
+	RequireApproval   bool
+	ApprovalStatePath string
 }
 
 func Load(explicitEnv string) (Config, error) {
@@ -36,17 +38,23 @@ func Load(explicitEnv string) (Config, error) {
 		return Config{}, err
 	}
 	host, _ := os.Hostname()
+	requireApproval := true
+	if v := firstNonEmpty(os.Getenv("HOMEFLEET_REQUIRE_APPROVAL")); v != "" {
+		requireApproval = truthy(v)
+	}
 	cfg := Config{
-		Token:       firstNonEmpty(os.Getenv("HOMEFLEET_TOKEN"), os.Getenv("DALE_TOKEN")),
-		ExecEnabled: truthy(firstNonEmpty(os.Getenv("HOMEFLEET_EXEC"), os.Getenv("DALE_REMOTE_EXEC"))),
-		Scope:       normalizeScope(firstNonEmpty(os.Getenv("HOMEFLEET_SCOPE"), os.Getenv("DALE_REMOTE_SCOPE"))),
-		DeviceID:    firstNonEmpty(os.Getenv("HOMEFLEET_DEVICE_ID"), host),
-		Hostname:    host,
-		OS:          runtime.GOOS,
-		HTTPPort:    DefaultHTTPPort,
-		BeaconPort:  DefaultBeaconPort,
-		AllowCIDRs:  splitCSV(os.Getenv("HOMEFLEET_ALLOW_CIDRS")),
-		EnvPath:     path,
+		Token:             firstNonEmpty(os.Getenv("HOMEFLEET_TOKEN"), os.Getenv("DALE_TOKEN")),
+		ExecEnabled:       truthy(firstNonEmpty(os.Getenv("HOMEFLEET_EXEC"), os.Getenv("DALE_REMOTE_EXEC"))),
+		Scope:             normalizeScope(firstNonEmpty(os.Getenv("HOMEFLEET_SCOPE"), os.Getenv("DALE_REMOTE_SCOPE"))),
+		DeviceID:          firstNonEmpty(os.Getenv("HOMEFLEET_DEVICE_ID"), host),
+		Hostname:          host,
+		OS:                runtime.GOOS,
+		HTTPPort:          DefaultHTTPPort,
+		BeaconPort:        DefaultBeaconPort,
+		AllowCIDRs:        splitCSV(os.Getenv("HOMEFLEET_ALLOW_CIDRS")),
+		EnvPath:           path,
+		RequireApproval:   requireApproval,
+		ApprovalStatePath: strings.TrimSpace(os.Getenv("HOMEFLEET_APPROVAL_FILE")),
 	}
 	if cfg.DeviceID == "" {
 		cfg.DeviceID = "unknown"

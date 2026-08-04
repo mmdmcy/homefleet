@@ -12,3 +12,5 @@
 .idea/
 .vscode/
 bin/
+# Local-only hardware inventory / upgrade notes (may contain device serials)
+private-inventory/

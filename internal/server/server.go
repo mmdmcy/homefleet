@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mmdmcy/homefleet/internal/approval"
 	"github.com/mmdmcy/homefleet/internal/config"
 	"github.com/mmdmcy/homefleet/internal/discover"
 	"github.com/mmdmcy/homefleet/internal/netpolicy"
@@ -24,9 +25,10 @@ type PeerLister interface {
 }
 
 type Server struct {
-	cfg   config.Config
-	mux   *http.ServeMux
-	peers PeerLister
+	cfg      config.Config
+	mux      *http.ServeMux
+	peers    PeerLister
+	approval *approval.Store
 }
 
 type ExecRequest struct {
@@ -48,13 +50,22 @@ type ExecResult struct {
 }
 
 type Whoami struct {
-	ID         string `json:"id"`
-	Hostname   string `json:"hostname"`
-	OS         string `json:"os"`
-	HTTPPort   int    `json:"http_port"`
-	ExecEnabled bool  `json:"exec_enabled"`
-	Scope      string `json:"scope"`
-	Proto      string `json:"proto"`
+	ID                string `json:"id"`
+	Hostname          string `json:"hostname"`
+	OS                string `json:"os"`
+	HTTPPort          int    `json:"http_port"`
+	ExecEnabled       bool   `json:"exec_enabled"`
+	Scope             string `json:"scope"`
+	Proto             string `json:"proto"`
+	ApprovalRequired  bool   `json:"approval_required"`
+	Approved          bool   `json:"approved"`
+	PendingApproval   bool   `json:"pending_approval"`
+	RemoteExecAllowed bool   `json:"remote_exec_allowed"`
+}
+
+type ApproveRequest struct {
+	PairingCode string `json:"pairing_code"`
+	ApproverID  string `json:"approver_id,omitempty"`
 }
 
 func New(cfg config.Config) *Server {
@@ -62,11 +73,18 @@ func New(cfg config.Config) *Server {
 }
 
 func NewWithPeers(cfg config.Config, peers PeerLister) *Server {
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), peers: peers}
+	return NewWithApproval(cfg, peers, nil)
+}
+
+func NewWithApproval(cfg config.Config, peers PeerLister, store *approval.Store) *Server {
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), peers: peers, approval: store}
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/v1/whoami", s.handleWhoami)
 	s.mux.HandleFunc("/v1/peers", s.handlePeers)
 	s.mux.HandleFunc("/v1/exec", s.handleExec)
+	s.mux.HandleFunc("/v1/approve", s.handleApprove)
+	s.mux.HandleFunc("/v1/pairing", s.handlePairing)
+	s.mux.HandleFunc("/v1/revoke", s.handleRevoke)
 	return s
 }
 
@@ -136,14 +154,19 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	approved := s.isApproved()
 	writeJSON(w, http.StatusOK, Whoami{
-		ID:          s.cfg.DeviceID,
-		Hostname:    s.cfg.Hostname,
-		OS:          s.cfg.OS,
-		HTTPPort:    s.cfg.HTTPPort,
-		ExecEnabled: s.cfg.ExecEnabled,
-		Scope:       s.cfg.Scope,
-		Proto:       config.DefaultProto,
+		ID:                s.cfg.DeviceID,
+		Hostname:          s.cfg.Hostname,
+		OS:                s.cfg.OS,
+		HTTPPort:          s.cfg.HTTPPort,
+		ExecEnabled:       s.cfg.ExecEnabled,
+		Scope:             s.cfg.Scope,
+		Proto:             config.DefaultProto,
+		ApprovalRequired:  s.cfg.RequireApproval,
+		Approved:          approved,
+		PendingApproval:   s.cfg.RequireApproval && !approved,
+		RemoteExecAllowed: s.cfg.ExecEnabled && (!s.cfg.RequireApproval || approved),
 	})
 }
 
@@ -168,6 +191,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errors.New("remote exec disabled; set HOMEFLEET_EXEC=1 or DALE_REMOTE_EXEC=1 on this device"))
 		return
 	}
+	if s.cfg.RequireApproval && !s.isApproved() && !isLoopback(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, errors.New("device pending approval; from a trusted machine run: homefleet approve --host <ip> --code <pairing-code> (code is printed by `homefleet serve` on this device)"))
+		return
+	}
 	var req ExecRequest
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -181,6 +208,126 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if s.approval == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("approval store unavailable"))
+		return
+	}
+	var req ApproveRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	by := strings.TrimSpace(req.ApproverID)
+	if by == "" {
+		by = "remote"
+	}
+
+	// Loopback may approve without a code (operator on the machine).
+	if isLoopback(r.RemoteAddr) && strings.TrimSpace(req.PairingCode) == "" {
+		if err := s.approval.ApproveLocal(by); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else {
+		if strings.TrimSpace(req.PairingCode) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("pairing_code required (shown on the pending device when serve starts)"))
+			return
+		}
+		if err := s.approval.ApproveWithCode(req.PairingCode, by); err != nil {
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
+	}
+	st := s.approval.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"approved":    st.Approved,
+		"approved_by": st.ApprovedBy,
+		"approved_at": st.ApprovedAt,
+		"device_id":   s.cfg.DeviceID,
+	})
+}
+
+func (s *Server) handlePairing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !isLoopback(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, errors.New("pairing code is only available on loopback"))
+		return
+	}
+	if s.approval == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("approval store unavailable"))
+		return
+	}
+	st := s.approval.Snapshot()
+	out := map[string]any{
+		"device_id":          s.cfg.DeviceID,
+		"hostname":           s.cfg.Hostname,
+		"approved":           st.Approved,
+		"approval_required":  s.cfg.RequireApproval,
+		"pending_approval":   s.cfg.RequireApproval && !st.Approved,
+		"pairing_code":       nil,
+	}
+	if !st.Approved {
+		code := s.approval.PairingCode()
+		if code == "" {
+			var err error
+			code, err = s.approval.EnsurePairing()
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		out["pairing_code"] = code
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !isLoopback(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, errors.New("revoke is only allowed on loopback"))
+		return
+	}
+	if s.approval == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("approval store unavailable"))
+		return
+	}
+	if err := s.approval.Revoke(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	code := s.approval.PairingCode()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"approved":     false,
+		"pairing_code": code,
+		"device_id":    s.cfg.DeviceID,
+	})
+}
+
+func (s *Server) isApproved() bool {
+	if !s.cfg.RequireApproval {
+		return true
+	}
+	if s.approval == nil {
+		return false
+	}
+	return s.approval.Snapshot().Approved
 }
 
 func runCommand(ctx context.Context, req ExecRequest) (ExecResult, error) {
@@ -236,6 +383,11 @@ func validBearer(header, token string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+func isLoopback(remoteAddr string) bool {
+	ip := netpolicy.ParseIP(remoteAddr)
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

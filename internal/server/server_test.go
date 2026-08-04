@@ -5,20 +5,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
+	"github.com/mmdmcy/homefleet/internal/approval"
 	"github.com/mmdmcy/homefleet/internal/config"
 )
 
 func TestExecRequiresTokenAndOptIn(t *testing.T) {
 	cfg := config.Config{
-		Token:       "secret",
-		ExecEnabled: true,
-		Scope:       "private",
-		DeviceID:    "laptop",
-		Hostname:    "laptop",
-		OS:          "linux",
-		HTTPPort:    7350,
+		Token:           "secret",
+		ExecEnabled:     true,
+		Scope:           "private",
+		DeviceID:        "laptop",
+		Hostname:        "laptop",
+		OS:              "linux",
+		HTTPPort:        7350,
+		RequireApproval: false,
 	}
 	s := New(cfg)
 
@@ -62,7 +65,7 @@ func TestPublicIPRejected(t *testing.T) {
 }
 
 func TestExecDisabled(t *testing.T) {
-	cfg := config.Config{Token: "secret", ExecEnabled: false, Scope: "private", DeviceID: "x", Hostname: "x", OS: "linux"}
+	cfg := config.Config{Token: "secret", ExecEnabled: false, Scope: "private", DeviceID: "x", Hostname: "x", OS: "linux", RequireApproval: false}
 	s := New(cfg)
 	req := httptest.NewRequest(http.MethodPost, "/v1/exec", bytes.NewBufferString(`{"command":"hostname"}`))
 	req.RemoteAddr = "127.0.0.1:9"
@@ -72,5 +75,100 @@ func TestExecDisabled(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPendingApprovalBlocksRemoteExec(t *testing.T) {
+	dir := t.TempDir()
+	store, err := approval.Open(filepath.Join(dir, "approval.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := store.EnsurePairing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Token:           "secret",
+		ExecEnabled:     true,
+		Scope:           "private",
+		DeviceID:        "newbox",
+		Hostname:        "newbox",
+		OS:              "linux",
+		RequireApproval: true,
+	}
+	s := NewWithApproval(cfg, nil, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/exec", bytes.NewBufferString(`{"command":"hostname"}`))
+	req.RemoteAddr = "192.168.1.2:9"
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 pending, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Loopback still works while pending (local smoke tests).
+	req = httptest.NewRequest(http.MethodPost, "/v1/exec", bytes.NewBufferString(`{"command":"hostname"}`))
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback exec should work while pending, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	body, _ := json.Marshal(ApproveRequest{PairingCode: code, ApproverID: "controller"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/approve", bytes.NewReader(body))
+	req.RemoteAddr = "192.168.1.2:9"
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/exec", bytes.NewBufferString(`{"command":"hostname"}`))
+	req.RemoteAddr = "192.168.1.2:9"
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exec after approve: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPairingCodeLoopbackOnly(t *testing.T) {
+	dir := t.TempDir()
+	store, err := approval.Open(filepath.Join(dir, "approval.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnsurePairing(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Token: "secret", Scope: "private", DeviceID: "x", Hostname: "x", OS: "linux", RequireApproval: true}
+	s := NewWithApproval(cfg, nil, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/pairing", nil)
+	req.RemoteAddr = "192.168.1.2:9"
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/pairing", nil)
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %s", rec.Code, rec.Body.String())
 	}
 }

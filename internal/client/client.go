@@ -64,6 +64,27 @@ func (c *Client) Exec(ctx context.Context, baseURL string, req server.ExecReques
 	return out, err
 }
 
+func (c *Client) Approve(ctx context.Context, baseURL string, pairingCode, approverID string) (map[string]any, error) {
+	var out map[string]any
+	err := c.postJSON(ctx, baseURL, "/v1/approve", server.ApproveRequest{
+		PairingCode: pairingCode,
+		ApproverID:  approverID,
+	}, &out)
+	return out, err
+}
+
+func (c *Client) Revoke(ctx context.Context, baseURL string) (map[string]any, error) {
+	var out map[string]any
+	err := c.postJSON(ctx, baseURL, "/v1/revoke", map[string]any{}, &out)
+	return out, err
+}
+
+func (c *Client) Pairing(ctx context.Context, baseURL string) (map[string]any, error) {
+	var out map[string]any
+	err := c.getJSON(ctx, baseURL, "/v1/pairing", &out)
+	return out, err
+}
+
 func (c *Client) getJSON(ctx context.Context, baseURL, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+path, nil)
 	if err != nil {
@@ -180,7 +201,11 @@ func Doctor(ctx context.Context, c *Client, baseURL string) map[string]any {
 	if err != nil {
 		add("remote-exec", false, err.Error())
 		report["checks"] = checks
-		report["conclusion"] = "Auth works. Remote exec is disabled or blocked; set HOMEFLEET_EXEC=1 or DALE_REMOTE_EXEC=1 on the remote device."
+		if who.PendingApproval {
+			report["conclusion"] = "Auth works, but this device is pending approval. On the device, read the pairing code from `homefleet serve` output (or `homefleet pairing` locally), then run: homefleet approve --host <ip> --code <code>"
+		} else {
+			report["conclusion"] = "Auth works. Remote exec is disabled or blocked; set HOMEFLEET_EXEC=1 or DALE_REMOTE_EXEC=1 on the remote device."
+		}
 		return report
 	}
 	detail := strings.TrimSpace(result.Stdout + " " + result.Stderr)
