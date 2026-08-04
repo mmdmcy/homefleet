@@ -1,0 +1,14 @@
+.env
+*.env
+!.env.example
+/dist/
+/bin/
+/homefleet
+/homefleet.exe
+*.exe
+*.test
+*.out
+.DS_Store
+.idea/
+.vscode/
+bin/
