@@ -1,6 +1,7 @@
 package approval
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -61,5 +62,40 @@ func TestApproveWithCodeAndLocal(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWrongCodesResetPairingCode(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "approval.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := store.EnsurePairing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < MaxCodeAttempts; i++ {
+		if err := store.ApproveWithCode("0000-0000", "x"); err == nil || errors.Is(err, ErrCodeReset) {
+			t.Fatalf("attempt %d: got %v", i, err)
+		}
+	}
+	if store.PairingCode() != code {
+		t.Fatal("code changed before the attempt limit")
+	}
+	if err := store.ApproveWithCode("0000-0000", "x"); !errors.Is(err, ErrCodeReset) {
+		t.Fatalf("expected ErrCodeReset, got %v", err)
+	}
+	fresh := store.PairingCode()
+	if fresh == "" || fresh == code {
+		t.Fatal("expected a new pairing code after too many failures")
+	}
+	if err := store.ApproveWithCode(code, "x"); err == nil {
+		t.Fatal("old code must be invalid after reset")
+	}
+	if err := store.ApproveWithCode(fresh, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if !store.Snapshot().Approved {
+		t.Fatal("expected approved with the fresh code")
 	}
 }

@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +31,64 @@ type Server struct {
 	mux      *http.ServeMux
 	peers    PeerLister
 	approval *approval.Store
+	limiter  *approveLimiter
+}
+
+// approveLimiter slows pairing-code guessing per source IP: after each wrong
+// code the IP must wait 1s, 2s, 4s ... up to maxApproveBackoff before the
+// next attempt is even checked. The store's attempt counter (approval.
+// MaxCodeAttempts) is the hard stop; this keeps a distributed guesser slow.
+type approveLimiter struct {
+	mu   sync.Mutex
+	now  func() time.Time
+	byIP map[string]approveState
+}
+
+type approveState struct {
+	failures int
+	until    time.Time
+}
+
+const maxApproveBackoff = 60 * time.Second
+
+func newApproveLimiter() *approveLimiter {
+	return &approveLimiter{now: time.Now, byIP: map[string]approveState{}}
+}
+
+// allow reports whether ip may attempt a code now, else how long to wait.
+func (l *approveLimiter) allow(ip string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.byIP[ip]
+	if wait := st.until.Sub(l.now()); wait > 0 {
+		return false, wait
+	}
+	return true, 0
+}
+
+func (l *approveLimiter) record(ip string, ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if ok {
+		delete(l.byIP, ip)
+		return
+	}
+	if len(l.byIP) > 1024 {
+		for k, st := range l.byIP {
+			if now.After(st.until.Add(maxApproveBackoff)) {
+				delete(l.byIP, k)
+			}
+		}
+	}
+	st := l.byIP[ip]
+	st.failures++
+	backoff := time.Second << uint(min(st.failures-1, 6))
+	if backoff > maxApproveBackoff {
+		backoff = maxApproveBackoff
+	}
+	st.until = now.Add(backoff)
+	l.byIP[ip] = st
 }
 
 type ExecRequest struct {
@@ -77,7 +137,7 @@ func NewWithPeers(cfg config.Config, peers PeerLister) *Server {
 }
 
 func NewWithApproval(cfg config.Config, peers PeerLister, store *approval.Store) *Server {
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), peers: peers, approval: store}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), peers: peers, approval: store, limiter: newApproveLimiter()}
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/v1/whoami", s.handleWhoami)
 	s.mux.HandleFunc("/v1/peers", s.handlePeers)
@@ -242,7 +302,19 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("pairing_code required (shown on the pending device when serve starts)"))
 			return
 		}
-		if err := s.approval.ApproveWithCode(req.PairingCode, by); err != nil {
+		ip := netpolicy.ParseIP(r.RemoteAddr).String()
+		if ok, wait := s.limiter.allow(ip); !ok {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+			writeError(w, http.StatusTooManyRequests, fmt.Errorf("too many failed pairing attempts; retry in %s", wait.Round(time.Second)))
+			return
+		}
+		err := s.approval.ApproveWithCode(req.PairingCode, by)
+		s.limiter.record(ip, err == nil)
+		if err != nil {
+			if errors.Is(err, approval.ErrCodeReset) {
+				fmt.Fprintf(os.Stderr, "homefleet: %d failed pairing attempts (last from %s); new pairing code %s\n",
+					approval.MaxCodeAttempts, ip, s.approval.PairingCode())
+			}
 			writeError(w, http.StatusForbidden, err)
 			return
 		}
@@ -272,12 +344,12 @@ func (s *Server) handlePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	st := s.approval.Snapshot()
 	out := map[string]any{
-		"device_id":          s.cfg.DeviceID,
-		"hostname":           s.cfg.Hostname,
-		"approved":           st.Approved,
-		"approval_required":  s.cfg.RequireApproval,
-		"pending_approval":   s.cfg.RequireApproval && !st.Approved,
-		"pairing_code":       nil,
+		"device_id":         s.cfg.DeviceID,
+		"hostname":          s.cfg.Hostname,
+		"approved":          st.Approved,
+		"approval_required": s.cfg.RequireApproval,
+		"pending_approval":  s.cfg.RequireApproval && !st.Approved,
+		"pairing_code":      nil,
 	}
 	if !st.Approved {
 		code := s.approval.PairingCode()

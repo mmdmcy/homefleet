@@ -151,7 +151,7 @@ func ResolveBaseURL(ctx context.Context, cfg config.Config, device, host string,
 	if beaconPort <= 0 {
 		beaconPort = config.DefaultBeaconPort
 	}
-	peers, err := discover.ListenOnce(ctx, beaconPort, 3*time.Second)
+	peers, err := discover.ListenOnce(ctx, cfg.Token, beaconPort, 3*time.Second)
 	if err != nil {
 		return "", err
 	}

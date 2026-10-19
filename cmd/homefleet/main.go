@@ -151,7 +151,7 @@ func cmdPeers(cfg config.Config, args []string) error {
 		}
 	}
 	if len(peers) == 0 {
-		peers, err = discover.ListenOnce(context.Background(), beaconPort, wait)
+		peers, err = discover.ListenOnce(context.Background(), cfg.Token, beaconPort, wait)
 		if err != nil {
 			return err
 		}
@@ -182,15 +182,15 @@ func cmdDevices(cfg config.Config, args []string) error {
 	if err != nil {
 		return err
 	}
-	peers, err := discover.ListenOnce(context.Background(), beaconPort, wait)
+	peers, err := discover.ListenOnce(context.Background(), cfg.Token, beaconPort, wait)
 	if err != nil {
 		return err
 	}
 	cli := client.New(cfg.Token)
 	type row struct {
-		Peer     discover.Peer  `json:"peer"`
-		Whoami   *server.Whoami `json:"whoami,omitempty"`
-		Error    string         `json:"error,omitempty"`
+		Peer   discover.Peer  `json:"peer"`
+		Whoami *server.Whoami `json:"whoami,omitempty"`
+		Error  string         `json:"error,omitempty"`
 	}
 	rows := make([]row, 0, len(peers))
 	for _, peer := range peers {
@@ -426,10 +426,10 @@ func cmdPairing(cfg config.Config, args []string) error {
 	}
 	if flagBool(args, "--json") {
 		return printJSON(map[string]any{
-			"device_id":     cfg.DeviceID,
-			"pairing_code":  code,
-			"approved":      false,
-			"state_file":    store.Path(),
+			"device_id":    cfg.DeviceID,
+			"pairing_code": code,
+			"approved":     false,
+			"state_file":   store.Path(),
 		})
 	}
 	fmt.Printf("pairing code: %s\n", code)

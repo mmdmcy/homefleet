@@ -25,12 +25,23 @@ type State struct {
 	PairingHash string `json:"pairing_hash,omitempty"`
 }
 
+// MaxCodeAttempts is how many wrong pairing codes are tolerated before the
+// code is thrown away and a new one minted. An 8-digit code would otherwise
+// fall to a token holder brute-forcing /v1/approve.
+const MaxCodeAttempts = 5
+
+// ErrCodeReset is returned by ApproveWithCode when the failed attempt was the
+// last one allowed: the old code is gone and a new one is active.
+var ErrCodeReset = errors.New("invalid pairing code; too many failed attempts, a new pairing code was generated (read it with `homefleet pairing` on the device)")
+
 type Store struct {
 	mu   sync.Mutex
 	path string
 	st   State
 	// plaintext code kept in memory for local display / loopback API only
 	code string
+	// failures counts wrong codes against the current code
+	failures int
 }
 
 func Dir() (string, error) {
@@ -102,13 +113,22 @@ func (s *Store) EnsurePairing() (code string, err error) {
 		return s.code, nil
 	}
 	// Restart or fresh pending: mint a new code (invalidates any previous printout).
-	code, err = generateCode()
-	if err != nil {
+	if err := s.mintLocked(); err != nil {
 		return "", err
+	}
+	return s.code, nil
+}
+
+// mintLocked replaces the pairing code, resets the failure counter and saves.
+func (s *Store) mintLocked() error {
+	code, err := generateCode()
+	if err != nil {
+		return err
 	}
 	s.code = code
 	s.st.PairingHash = hashCode(code)
-	return code, s.saveLocked()
+	s.failures = 0
+	return s.saveLocked()
 }
 
 // ApproveLocal marks this device approved without a pairing code (operator at the machine).
@@ -137,7 +157,14 @@ func (s *Store) ApproveWithCode(code, by string) error {
 		return errors.New("no pairing code active; restart homefleet serve on this device")
 	}
 	if subtle.ConstantTimeCompare([]byte(hashCode(normalizeCode(code))), []byte(s.st.PairingHash)) != 1 {
-		return errors.New("invalid pairing code")
+		s.failures++
+		if s.failures < MaxCodeAttempts {
+			return errors.New("invalid pairing code")
+		}
+		if err := s.mintLocked(); err != nil {
+			return err
+		}
+		return ErrCodeReset
 	}
 	if by == "" {
 		by = "remote"
@@ -154,14 +181,7 @@ func (s *Store) Revoke() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.st = State{}
-	s.code = ""
-	code, err := generateCode()
-	if err != nil {
-		return err
-	}
-	s.code = code
-	s.st.PairingHash = hashCode(code)
-	return s.saveLocked()
+	return s.mintLocked()
 }
 
 func (s *Store) load() error {

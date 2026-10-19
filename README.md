@@ -93,7 +93,7 @@ If you already use Masterdale, the same `DALE_TOKEN` / `DALE_REMOTE_EXEC` / `DAL
 
 ## How it works
 
-- **UDP beacon** (default port `9999`): peers announce id, hostname, OS, and HTTP port. Beacons never include the token.
+- **UDP beacon** (default port `9999`): peers announce id, hostname, OS, and HTTP port. Beacons never include the token; they are **authenticated with it**: each beacon carries `ts`, a random `nonce` and `mac` = HMAC-SHA256 over the announced fields keyed with the shared token. Receivers drop beacons with a missing or wrong MAC, a timestamp more than 60 s off, or a nonce they have already seen. Only verified peers are listed or contacted, so a rogue LAN host cannot get itself discovered to harvest the token.
 - **HTTP agent** (default port `7350`): `/healthz`, `/v1/whoami`, `/v1/exec`, `/v1/approve`.
 - **Auth**: `Authorization: Bearer <token>` on `/v1/*`.
 - **Approval**: pending agents reject remote exec until `POST /v1/approve` with the pairing code (or local approve).
@@ -112,7 +112,9 @@ Read [SECURITY.md](SECURITY.md).
 Short version:
 
 - Shared token ≈ fleet root password.
-- Pairing code ≈ unlock for a new device (token alone is not enough while pending).
+- Pairing code ≈ unlock for a new device (token alone is not enough while pending). Five wrong codes replace the code; each wrong code from an IP doubles that IP's wait before the next attempt.
+- Discovery is HMAC-authenticated with the shared token: unsigned or wrongly signed beacons are ignored, so the token is only ever sent to hosts that already proved they hold it. All agents must run a version with authenticated discovery; older agents are invisible to newer ones (use `--host`). Clocks must agree to within 60 s.
+- Transport is still plain HTTP on the LAN/tailnet: a passive sniffer on an untrusted LAN can read the bearer token in flight. Run Homefleet only on networks you trust, or over Tailscale.
 - Do not port-forward Homefleet to the internet.
 - Leave `HOMEFLEET_EXEC=0` on machines that should not accept remote commands.
 - Prefer `HOMEFLEET_SCOPE=private` (default).

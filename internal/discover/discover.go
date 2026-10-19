@@ -2,11 +2,18 @@ package discover
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,14 +23,54 @@ import (
 const (
 	beaconInterval = 2 * time.Second
 	peerTTL        = 8 * time.Second
+	// beaconWindow bounds how old (or how far in the future, for clock skew) a
+	// beacon's timestamp may be before it is dropped as stale.
+	beaconWindow = 60 * time.Second
 )
 
+// Beacon is the UDP discovery announcement. Beacons are authenticated: MAC is
+// hex(HMAC-SHA256(token, canonical fields)) and TS/Nonce limit replay. A
+// beacon without a valid MAC is ignored, so peers are only ever stored (and
+// later sent the bearer token over HTTP) when they already hold the token.
 type Beacon struct {
 	Proto    string `json:"proto"`
 	ID       string `json:"id"`
 	Hostname string `json:"hostname"`
 	OS       string `json:"os"`
 	HTTPPort int    `json:"http_port"`
+	TS       int64  `json:"ts,omitempty"`    // unix seconds
+	Nonce    string `json:"nonce,omitempty"` // 16 hex chars
+	MAC      string `json:"mac,omitempty"`   // 64 hex chars
+}
+
+// canonical returns the bytes the MAC covers: every announced field, newline
+// separated, so a verified beacon cannot have had any field altered.
+func (b Beacon) canonical() string {
+	return strings.Join([]string{
+		b.Proto, b.ID, b.Hostname, b.OS,
+		fmt.Sprintf("%d", b.HTTPPort), fmt.Sprintf("%d", b.TS), b.Nonce,
+	}, "\n")
+}
+
+func beaconMAC(key []byte, b Beacon) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(b.canonical()))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// Sign stamps the beacon with the current time, a fresh nonce and the MAC.
+func Sign(key []byte, b Beacon, now time.Time) (Beacon, error) {
+	if len(key) == 0 {
+		return Beacon{}, errors.New("discovery needs the shared token to sign beacons")
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return Beacon{}, err
+	}
+	b.TS = now.Unix()
+	b.Nonce = hex.EncodeToString(nonce[:])
+	b.MAC = beaconMAC(key, b)
+	return b, nil
 }
 
 type Peer struct {
@@ -41,14 +88,19 @@ func (p Peer) BaseURL() string {
 }
 
 type Table struct {
-	mu    sync.Mutex
-	peers map[string]Peer
-	self  Beacon
+	mu     sync.Mutex
+	peers  map[string]Peer
+	self   Beacon
+	key    []byte
+	nonces map[string]time.Time // nonce -> expiry, to drop replayed beacons
+	warned bool
 }
 
 func NewTable(cfg config.Config) *Table {
 	return &Table{
-		peers: map[string]Peer{},
+		peers:  map[string]Peer{},
+		key:    []byte(cfg.Token),
+		nonces: map[string]time.Time{},
 		self: Beacon{
 			Proto:    config.DefaultProto,
 			ID:       cfg.DeviceID,
@@ -57,6 +109,53 @@ func NewTable(cfg config.Config) *Table {
 			HTTPPort: cfg.HTTPPort,
 		},
 	}
+}
+
+// Verify reports whether a received beacon is authentic: well formed, carrying
+// a MAC computed with this table's token, timestamped within beaconWindow of
+// now, and not seen before (nonce). Anything else is silently dropped; the
+// first unauthenticated beacon per table is noted once on stderr so an
+// operator can tell "old version / different token" from "nothing on the LAN".
+func (t *Table) Verify(b Beacon, now time.Time) bool {
+	if b.Proto != config.DefaultProto || b.ID == "" || b.HTTPPort < 1 || len(t.key) == 0 {
+		return false
+	}
+	want, err := hex.DecodeString(b.MAC)
+	if err != nil || len(want) != sha256.Size || b.Nonce == "" {
+		t.warnOnce(b.ID)
+		return false
+	}
+	got, _ := hex.DecodeString(beaconMAC(t.key, b))
+	if !hmac.Equal(got, want) {
+		t.warnOnce(b.ID)
+		return false
+	}
+	age := now.Sub(time.Unix(b.TS, 0))
+	if age > beaconWindow || age < -beaconWindow {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for nonce, expiry := range t.nonces {
+		if now.After(expiry) {
+			delete(t.nonces, nonce)
+		}
+	}
+	if _, seen := t.nonces[b.Nonce]; seen {
+		return false
+	}
+	t.nonces[b.Nonce] = now.Add(beaconWindow)
+	return true
+}
+
+func (t *Table) warnOnce(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.warned {
+		return
+	}
+	t.warned = true
+	fmt.Fprintf(os.Stderr, "homefleet: ignoring unauthenticated discovery beacon from %q (peer runs an old version or a different token)\n", id)
 }
 
 func (t *Table) Upsert(peer Peer) {
@@ -104,8 +203,9 @@ func (t *Table) Find(query string) (Peer, error) {
 	return matches[0], nil
 }
 
-func (t *Table) SelfBeacon() Beacon {
-	return t.self
+// SelfBeacon returns a freshly signed announcement for this device.
+func (t *Table) SelfBeacon() (Beacon, error) {
+	return Sign(t.key, t.self, time.Now())
 }
 
 func listenUDP(ctx context.Context, network string, addr string) (*net.UDPConn, error) {
@@ -153,7 +253,11 @@ func RunBeacon(ctx context.Context, cfg config.Config, table *Table) error {
 			HTTPPort: cfg.HTTPPort,
 			Self:     true,
 		})
-		payload, _ := json.Marshal(table.SelfBeacon())
+		beacon, err := table.SelfBeacon()
+		if err != nil {
+			return
+		}
+		payload, _ := json.Marshal(beacon)
 		for _, dst := range broadcastAddrs(cfg.BeaconPort) {
 			_, _ = conn.WriteToUDP(payload, dst)
 		}
@@ -186,7 +290,7 @@ func receiveBeacons(ctx context.Context, conn *net.UDPConn, table *Table, selfID
 		if err := json.Unmarshal(buf[:n], &beacon); err != nil {
 			continue
 		}
-		if beacon.Proto != config.DefaultProto || beacon.ID == "" || beacon.HTTPPort < 1 {
+		if !table.Verify(beacon, time.Now()) {
 			continue
 		}
 		table.Upsert(Peer{
@@ -200,8 +304,14 @@ func receiveBeacons(ctx context.Context, conn *net.UDPConn, table *Table, selfID
 	}
 }
 
-func ListenOnce(ctx context.Context, beaconPort int, duration time.Duration) ([]Peer, error) {
+// ListenOnce collects authenticated beacons for duration. The token is needed
+// to verify them; without it nothing can be trusted, so it is an error.
+func ListenOnce(ctx context.Context, token string, beaconPort int, duration time.Duration) ([]Peer, error) {
+	if token == "" {
+		return nil, errors.New("missing token: discovery beacons are authenticated with HOMEFLEET_TOKEN or DALE_TOKEN")
+	}
 	cfg := config.Config{
+		Token:      token,
 		DeviceID:   "listener",
 		Hostname:   "listener",
 		OS:         runtime.GOOS,

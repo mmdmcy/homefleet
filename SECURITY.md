@@ -13,8 +13,14 @@ Anyone who has the shared token **and** is talking to an **approved** device (wh
 - `/v1/*` requires `Authorization: Bearer <token>`.
 - Remote exec stays off until `HOMEFLEET_EXEC=1` or `DALE_REMOTE_EXEC=1`.
 - **Device approval** is on by default (`HOMEFLEET_REQUIRE_APPROVAL=1`): a pending device rejects remote `/v1/exec` until approved with its pairing code (or `homefleet approve --local` on that machine). Pairing codes are never returned over non-loopback HTTP.
+- Pairing codes cannot be guessed: after 5 wrong codes the pending device mints a new code (printed on its stderr and shown by `homefleet pairing`), and each wrong code from an IP doubles that IP's wait (1 s, 2 s, ... 60 s) before `/v1/approve` checks another.
 - Commands time out; stdout/stderr are truncated.
-- UDP discovery beacons never carry the token.
+- UDP discovery beacons never carry the token, and they are authenticated with it: `mac` = HMAC-SHA256(token, proto|id|hostname|os|http_port|ts|nonce). A beacon with a missing or wrong MAC, a `ts` more than 60 s from the receiver's clock, or a reused nonce is dropped without a reply. A rogue host that broadcasts beacons is never listed as a peer and never sent the token.
+
+## What is not protected
+
+- Transport is plain HTTP on the LAN/tailnet. Authenticated discovery stops rogue responders from harvesting the token; it does not stop a passive sniffer on an untrusted LAN from reading the `Authorization` header in flight. Use trusted networks or Tailscale.
+- `--host <ip>` bypasses discovery; the token is sent to whatever listens there.
 
 ## Approving a new device
 

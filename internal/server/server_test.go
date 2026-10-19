@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mmdmcy/homefleet/internal/approval"
 	"github.com/mmdmcy/homefleet/internal/config"
@@ -170,5 +171,83 @@ func TestPairingCodeLoopbackOnly(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestApproveBackoffPerIP(t *testing.T) {
+	store, err := approval.Open(filepath.Join(t.TempDir(), "approval.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := store.EnsurePairing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Token: "secret", ExecEnabled: true, Scope: "private", DeviceID: "x", Hostname: "x", OS: "linux", RequireApproval: true}
+	s := NewWithApproval(cfg, nil, store)
+	now := time.Now()
+	s.limiter.now = func() time.Time { return now }
+
+	approve := func(from, code string) int {
+		body, _ := json.Marshal(ApproveRequest{PairingCode: code})
+		req := httptest.NewRequest(http.MethodPost, "/v1/approve", bytes.NewReader(body))
+		req.RemoteAddr = from
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := approve("192.168.1.2:1", "0000-0000"); got != http.StatusForbidden {
+		t.Fatalf("wrong code: expected 403, got %d", got)
+	}
+	// Same IP is held back even with the right code; another IP is not.
+	if got := approve("192.168.1.2:2", code); got != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 during backoff, got %d", got)
+	}
+	if store.Snapshot().Approved {
+		t.Fatal("approval must not happen while the IP is backed off")
+	}
+	now = now.Add(2 * time.Second)
+	if got := approve("192.168.1.2:3", "0000-0001"); got != http.StatusForbidden {
+		t.Fatalf("second wrong code: expected 403, got %d", got)
+	}
+	now = now.Add(time.Second) // backoff is 2s now; 1s is not enough
+	if got := approve("192.168.1.2:4", code); got != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 under doubled backoff, got %d", got)
+	}
+	if got := approve("192.168.1.3:1", code); got != http.StatusOK {
+		t.Fatalf("other IP with right code: expected 200, got %d", got)
+	}
+}
+
+func TestApproveCodeResetAfterTooManyAttempts(t *testing.T) {
+	store, err := approval.Open(filepath.Join(t.TempDir(), "approval.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := store.EnsurePairing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Token: "secret", Scope: "private", DeviceID: "x", Hostname: "x", OS: "linux", RequireApproval: true}
+	s := NewWithApproval(cfg, nil, store)
+	now := time.Now()
+	s.limiter.now = func() time.Time { return now }
+	for i := 0; i < approval.MaxCodeAttempts; i++ {
+		now = now.Add(2 * maxApproveBackoff)
+		body, _ := json.Marshal(ApproveRequest{PairingCode: "0000-0000"})
+		req := httptest.NewRequest(http.MethodPost, "/v1/approve", bytes.NewReader(body))
+		req.RemoteAddr = "192.168.1.2:9"
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("attempt %d: expected 403, got %d %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if fresh := store.PairingCode(); fresh == "" || fresh == code {
+		t.Fatal("expected a regenerated pairing code")
 	}
 }
